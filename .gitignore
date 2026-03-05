@@ -1,4 +1,39 @@
-misc/
-.vscode/
+# Virtual environment
+venv/
+env/
+ENV/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+
+# Credentials
+credentials.json
+*.secret.json
+
+# Data files
+data/
 *.json
+!requirements.json
+!package.json
+
+# Logs and screenshots
+*.log
+*.png
+*.jpg
+*.jpeg
+*.gif
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
 
