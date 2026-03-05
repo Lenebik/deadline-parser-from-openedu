@@ -1,6 +1,6 @@
 # Openedu Deadline Extractor
 
-Create a `credentials.json` file in the project's root directory with the following structure:
+Create a folder named "misc" in the project's root directory, then create `credentials.json` in mentioned folder with the following structure:
 
     {
         "moodle": {
