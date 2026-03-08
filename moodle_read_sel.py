@@ -393,6 +393,10 @@ class MoodleDeadlineParser:
                                     col_count = len(header_cells)
                                     print(f"    Колонок в таблице: {col_count}")
                                 
+                                # Словарь для отслеживания объединенных ячеек
+                                # key: индекс колонки, value: [осталось_строк, текст]
+                                rowspan_tracker = {}
+                                
                                 # Пропускаем заголовочную строку (первую)
                                 for row_index, row in enumerate(rows):
                                     if row_index == 0:  # Пропускаем заголовок
@@ -406,14 +410,56 @@ class MoodleDeadlineParser:
                                             continue
                                         
                                         # Первая ячейка - название задания
-                                        title = cells[0].text.strip()
+                                        title_cell = cells[0]
+                                        title = title_cell.text.strip()
                                         
                                         if not title:
                                             continue
                                         
-                                        # Берем ПОСЛЕДНЮЮ ячейку как жесткий дедлайн
-                                        last_cell = cells[-1]
-                                        date_text = last_cell.text.strip()
+                                        # Получаем информацию о rowspan в первой ячейке
+                                        title_rowspan = 1
+                                        try:
+                                            rowspan_attr = title_cell.get_attribute("rowspan")
+                                            if rowspan_attr:
+                                                title_rowspan = int(rowspan_attr)
+                                        except:
+                                            pass
+                                        
+                                        # Определяем дату для этой строки
+                                        date_text = None
+                                        
+                                        # Проверяем, есть ли объединенная ячейка с датой для этой строки
+                                        for col_idx, (remaining, text) in list(rowspan_tracker.items()):
+                                            if remaining > 0:
+                                                date_text = text
+                                                rowspan_tracker[col_idx] = [remaining - 1, text]
+                                                break
+                                        
+                                        # Если нет активной объединенной ячейки, ищем новую
+                                        if not date_text:
+                                            # Перебираем ячейки с конца, чтобы найти ячейку с датой
+                                            for cell in reversed(cells):
+                                                cell_text = cell.text.strip()
+                                                if cell_text and ('.' in cell_text or cell_text.replace('-', '').strip()):
+                                                    date_text = cell_text
+                                                    
+                                                    # Проверяем rowspan у этой ячейки
+                                                    try:
+                                                        rowspan_attr = cell.get_attribute("rowspan")
+                                                        if rowspan_attr:
+                                                            rowspan = int(rowspan_attr)
+                                                            if rowspan > 1:
+                                                                # Запоминаем эту ячейку для следующих строк
+                                                                col_index = cells.index(cell)
+                                                                rowspan_tracker[col_index] = [rowspan - 1, cell_text]
+                                                    except:
+                                                        pass
+                                                    break
+                                        
+                                        # Если дата не найдена, используем дату из последней ячейки
+                                        if not date_text:
+                                            last_cell = cells[-1]
+                                            date_text = last_cell.text.strip()
                                         
                                         # Пропускаем если дата не указана или это специальное значение
                                         if not date_text or date_text == '-' or date_text == '—' or 'инд.' in date_text.lower():
@@ -466,6 +512,9 @@ class MoodleDeadlineParser:
                                     except Exception as e:
                                         print(f"    ⚠️ Ошибка обработки строки {row_index}: {e}")
                                         continue
+                                
+                                # Очищаем трекер для следующей таблицы
+                                rowspan_tracker.clear()
 
                     except Exception as e:
                         print(f"⚠️ Ошибка при парсинге таблицы: {e}")
