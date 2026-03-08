@@ -30,13 +30,14 @@ class Deadline:
 
 
 class MoodleDeadlineParser:
-    def __init__(self, username, password, chrome_profile=""):
+    def __init__(self, username, password, chrome_profile="", headless=False):
         self.username = username
         self.password = password
         self.chrome_profile = chrome_profile
+        self.headless = headless  # Добавить эту строку!
         self.deadlines = []  # Массив структур Deadline
         self.driver = None
-    
+        
     def init_driver(self):
         """Инициализация драйвера Chrome"""
         options = webdriver.ChromeOptions()
@@ -49,7 +50,14 @@ class MoodleDeadlineParser:
         options.add_argument("--disable-dev-shm-usage")
         options.add_argument("--remote-allow-origins=*")
         
-        print("🟢 Запуск браузера...")
+        # Добавляем headless режим если выбран
+        if self.headless:
+            options.add_argument("--headless=new")
+            options.add_argument("--window-size=1920,1080")
+            print("🟢 Запуск браузера в фоновом режиме...")
+        else:
+            print("🟢 Запуск браузера...")
+        
         self.driver = webdriver.Chrome(options=options)
         self.driver.implicitly_wait(10)
     
@@ -277,28 +285,66 @@ class MoodleDeadlineParser:
         deadlines = []
         
         try:
-            # Шаг 1: Нажимаем на иконку профиля
-            print("\n👤 Открываем меню профиля...")
-            profile_icon = WebDriverWait(self.driver, 10).until(
-                EC.element_to_be_clickable((By.CSS_SELECTOR, "img.profile-menu__icon"))
-            )
-            profile_icon.click()
-            sleep(2)
-            
-            # Шаг 2: Нажимаем "Мои курсы" в выпадающем меню
-            print("📚 Переходим в 'Мои курсы'...")
-            my_courses_link = WebDriverWait(self.driver, 10).until(
-                EC.element_to_be_clickable((By.XPATH, "//a[contains(@href, '/my/courses/') and contains(text(), 'Мои курсы')]"))
-            )
-            my_courses_link.click()
-            sleep(5)
+            # Для headless режима используем прямой переход
+            if self.headless:
+                print("\n🖥️ Фоновый режим: прямой переход на страницу курсов...")
+                self.driver.get('https://openedu.ru/my/courses/')
+                sleep(8)
+                
+                # Проверяем, не перенаправило ли на страницу входа
+                if "login" in self.driver.current_url or "auth" in self.driver.current_url:
+                    print("⚠️ Требуется авторизация, выполняем вход...")
+                    # Если вылетело из сессии, пробуем войти заново
+                    if not self.login_openedu():
+                        print("❌ Не удалось авторизоваться")
+                        return deadlines
+                    # После входа снова переходим на курсы
+                    self.driver.get('https://openedu.ru/my/courses/')
+                    sleep(8)
+            else:
+                # Для обычного режима - кликаем по меню
+                print("\n👤 Открываем меню профиля...")
+                try:
+                    profile_icon = WebDriverWait(self.driver, 10).until(
+                        EC.element_to_be_clickable((By.CSS_SELECTOR, "img.profile-menu__icon"))
+                    )
+                    profile_icon.click()
+                    sleep(2)
+                    
+                    print("📚 Переходим в 'Мои курсы'...")
+                    my_courses_link = WebDriverWait(self.driver, 10).until(
+                        EC.element_to_be_clickable((By.XPATH, "//a[contains(@href, '/my/courses/') and contains(text(), 'Мои курсы')]"))
+                    )
+                    my_courses_link.click()
+                    sleep(5)
+                except Exception as e:
+                    print(f"⚠️ Ошибка при навигации через меню: {e}")
+                    print("➡️ Пробуем прямой переход...")
+                    self.driver.get('https://openedu.ru/my/courses/')
+                    sleep(8)
             
             # Шаг 3: Получаем ВСЕ названия курсов
             print("🔍 Ищем все курсы...")
             
+            # Ждем загрузки карточек курсов
+            wait_time = 20 if self.headless else 10
+            try:
+                WebDriverWait(self.driver, wait_time).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, "div.ed-product-card"))
+                )
+                print("✅ Карточки курсов загружены")
+            except:
+                print("⚠️ Карточки курсов не загрузились, пробуем продолжить...")
+            
             # Находим все карточки курсов
             course_cards = self.driver.find_elements(By.CSS_SELECTOR, "div.ed-product-card")
             print(f"📊 Найдено карточек курсов: {len(course_cards)}")
+            
+            if len(course_cards) == 0:
+                print("❌ Нет доступных курсов")
+                # Сохраняем скриншот для отладки
+                self.driver.save_screenshot("openedu_no_courses.png")
+                return deadlines
             
             # Сохраняем названия курсов
             course_titles = []
@@ -328,11 +374,21 @@ class MoodleDeadlineParser:
                     
                     # Прокручиваем до кнопки и кликаем
                     self.driver.execute_script("arguments[0].scrollIntoView(true);", current_button)
-                    sleep(1)
-                    current_button.click()
+                    sleep(2 if not self.headless else 3)
+                    
+                    # Пробуем кликнуть разными способами
+                    try:
+                        current_button.click()
+                    except:
+                        try:
+                            self.driver.execute_script("arguments[0].click();", current_button)
+                        except Exception as e:
+                            print(f"⚠️ Не удалось кликнуть по кнопке: {e}")
+                            continue
+                    
                     print("✅ Перешли к материалам курса")
                     
-                    sleep(5)  # Ждем загрузки страницы курса
+                    sleep(5 if not self.headless else 8)
                     
                     # Шаг 5: Ищем и нажимаем "Расписание курса"
                     try:
@@ -348,7 +404,9 @@ class MoodleDeadlineParser:
                         
                         for selector in selectors:
                             try:
-                                schedule_link = self.driver.find_element(By.XPATH, selector)
+                                schedule_link = WebDriverWait(self.driver, 5).until(
+                                    EC.element_to_be_clickable((By.XPATH, selector))
+                                )
                                 schedule_link.click()
                                 print("✅ Перешли в расписание курса")
                                 schedule_found = True
@@ -358,23 +416,25 @@ class MoodleDeadlineParser:
                         
                         if not schedule_found:
                             print("⚠️ Ссылка на расписание не найдена")
-                            self.driver.back()
-                            sleep(3)
-                            # Возвращаемся к списку курсов
                             self.driver.get('https://openedu.ru/my/courses/')
-                            sleep(3)
+                            sleep(5 if not self.headless else 8)
                             continue
                         
-                        sleep(5)
+                        sleep(5 if not self.headless else 8)
                         
                     except Exception as e:
                         print(f"⚠️ Ошибка при переходе в расписание: {e}")
                         self.driver.get('https://openedu.ru/my/courses/')
-                        sleep(3)
+                        sleep(5 if not self.headless else 8)
                         continue
                     
-                    # Шаг 6: Парсим таблицу расписания
+                    # Шаг 6: Парсим таблицу расписания (код парсинга таблицы без изменений)
                     try:
+                        # Ждем загрузки таблицы
+                        WebDriverWait(self.driver, wait_time).until(
+                            EC.presence_of_element_located((By.TAG_NAME, "table"))
+                        )
+                        
                         tables = self.driver.find_elements(By.TAG_NAME, "table")
                         
                         if not tables:
@@ -394,79 +454,58 @@ class MoodleDeadlineParser:
                                     print(f"    Колонок в таблице: {col_count}")
                                 
                                 # Словарь для отслеживания объединенных ячеек
-                                # key: индекс колонки, value: [осталось_строк, текст]
                                 rowspan_tracker = {}
                                 
                                 # Пропускаем заголовочную строку (первую)
                                 for row_index, row in enumerate(rows):
-                                    if row_index == 0:  # Пропускаем заголовок
+                                    if row_index == 0:
                                         continue
                                     
                                     try:
-                                        # Получаем все ячейки в строке
                                         cells = row.find_elements(By.TAG_NAME, "td")
                                         
                                         if not cells:
                                             continue
                                         
-                                        # Первая ячейка - название задания
-                                        title_cell = cells[0]
-                                        title = title_cell.text.strip()
+                                        title = cells[0].text.strip()
                                         
                                         if not title:
                                             continue
                                         
-                                        # Получаем информацию о rowspan в первой ячейке
-                                        title_rowspan = 1
-                                        try:
-                                            rowspan_attr = title_cell.get_attribute("rowspan")
-                                            if rowspan_attr:
-                                                title_rowspan = int(rowspan_attr)
-                                        except:
-                                            pass
-                                        
-                                        # Определяем дату для этой строки
                                         date_text = None
                                         
-                                        # Проверяем, есть ли объединенная ячейка с датой для этой строки
+                                        # Проверяем объединенные ячейки
                                         for col_idx, (remaining, text) in list(rowspan_tracker.items()):
                                             if remaining > 0:
                                                 date_text = text
                                                 rowspan_tracker[col_idx] = [remaining - 1, text]
                                                 break
                                         
-                                        # Если нет активной объединенной ячейки, ищем новую
                                         if not date_text:
-                                            # Перебираем ячейки с конца, чтобы найти ячейку с датой
                                             for cell in reversed(cells):
                                                 cell_text = cell.text.strip()
                                                 if cell_text and ('.' in cell_text or cell_text.replace('-', '').strip()):
                                                     date_text = cell_text
                                                     
-                                                    # Проверяем rowspan у этой ячейки
                                                     try:
                                                         rowspan_attr = cell.get_attribute("rowspan")
                                                         if rowspan_attr:
                                                             rowspan = int(rowspan_attr)
                                                             if rowspan > 1:
-                                                                # Запоминаем эту ячейку для следующих строк
                                                                 col_index = cells.index(cell)
                                                                 rowspan_tracker[col_index] = [rowspan - 1, cell_text]
                                                     except:
                                                         pass
                                                     break
                                         
-                                        # Если дата не найдена, используем дату из последней ячейки
                                         if not date_text:
                                             last_cell = cells[-1]
                                             date_text = last_cell.text.strip()
                                         
-                                        # Пропускаем если дата не указана или это специальное значение
                                         if not date_text or date_text == '-' or date_text == '—' or 'инд.' in date_text.lower():
                                             print(f"    ⚠️ Пропущен (нет даты): {title} -> {date_text}")
                                             continue
                                         
-                                        # Парсим дату
                                         try:
                                             if '.' in date_text:
                                                 parts = date_text.split('.')
@@ -474,7 +513,6 @@ class MoodleDeadlineParser:
                                                     day = parts[0].strip().zfill(2)
                                                     month = parts[1].strip().zfill(2)
                                                     
-                                                    # Определяем год
                                                     if len(parts) >= 3:
                                                         year = parts[2].strip()
                                                         if len(year) == 2:
@@ -486,7 +524,6 @@ class MoodleDeadlineParser:
                                                     else:
                                                         year = "2026"
                                                     
-                                                    # Проверяем корректность
                                                     if day.isdigit() and month.isdigit() and year.isdigit():
                                                         formatted_date = f"{year}-{month}-{day}"
                                                         
@@ -513,7 +550,6 @@ class MoodleDeadlineParser:
                                         print(f"    ⚠️ Ошибка обработки строки {row_index}: {e}")
                                         continue
                                 
-                                # Очищаем трекер для следующей таблицы
                                 rowspan_tracker.clear()
 
                     except Exception as e:
@@ -522,13 +558,12 @@ class MoodleDeadlineParser:
                     # Шаг 7: Возвращаемся к списку курсов
                     print("⏎ Возвращаемся к списку курсов...")
                     self.driver.get('https://openedu.ru/my/courses/')
-                    sleep(5)
+                    sleep(5 if not self.headless else 8)
                     
                 except Exception as e:
                     print(f"⚠️ Ошибка при обработке курса {course_index}: {e}")
-                    # Возвращаемся к списку курсов в случае ошибки
                     self.driver.get('https://openedu.ru/my/courses/')
-                    sleep(5)
+                    sleep(5 if not self.headless else 8)
                     continue
             
             print(f"\n📌 Всего найдено дедлайнов Openedu: {len(deadlines)}")
@@ -579,20 +614,47 @@ class MoodleDeadlineParser:
         print("1. Получить дедлайны из LMS СПбПУ")
         print("2. Получить дедлайны из Openedu")
         print("3. Получить из обоих источников")
-        print("4. Выйти")
+        print("4. Настройки")
+        print("5. Выйти")
         print("-"*60)
         
-        choice = input("Выберите действие (1-4): ").strip()
+        choice = input("Выберите действие (1-5): ").strip()
         return choice
+    
+    def show_settings(self):
+        """Меню настроек"""
+        while True:
+            print("\n" + "="*60)
+            print("⚙️ НАСТРОЙКИ")
+            print("="*60)
+            mode = "фоновом" if self.headless else "обычном"
+            print(f"1. Режим отображения браузера: сейчас в {mode} режиме")
+            print("2. Вернуться в главное меню")
+            print("-"*60)
+            
+            choice = input("Выберите действие (1-2): ").strip()
+            
+            if choice == '1':
+                self.headless = not self.headless
+                mode = "фоновый" if self.headless else "обычный"
+                print(f"✅ Режим изменен на {mode}")
+            elif choice == '2':
+                break
+            else:
+                print("❌ Неверный выбор")
     
     def run(self):
         """Основной метод запуска с меню"""
         while True:
             choice = self.show_menu()
             
-            if choice == '4':
+            if choice == '5':
                 print("\n👋 До свидания!")
                 break
+            
+            if choice == '4':
+                self.show_settings()
+                continue
             
             if choice not in ['1', '2', '3']:
                 print("\n❌ Неверный выбор. Попробуйте снова.")
@@ -646,7 +708,6 @@ class MoodleDeadlineParser:
             print("\n" + "-"*60)
             input("Нажмите Enter, чтобы продолжить...")
 
-
 if __name__ == "__main__":
     # Загрузка credentials
     try:
@@ -668,11 +729,12 @@ if __name__ == "__main__":
         """)
         exit(1)
     
-    # Создаем парсер
+    # Создаем парсер (по умолчанию headless=False - браузер видимый)
     parser = MoodleDeadlineParser(
         username=data['moodle']['username'],
         password=data['moodle']['password'],
-        chrome_profile=data['chrome']['chrome_profile']
+        chrome_profile=data['chrome']['chrome_profile'],
+        headless=False  # По умолчанию браузер видимый
     )
     
     # Запускаем с меню
