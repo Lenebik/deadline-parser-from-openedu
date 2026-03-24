@@ -1,24 +1,24 @@
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import NoSuchElementException, TimeoutException
+from playwright.sync_api import sync_playwright, Page, Browser, TimeoutError as PlaywrightTimeout
+from datetime import datetime
 import json
 from time import sleep
-from datetime import datetime
 import os
+import re
+from typing import Optional, List
+
 
 class Deadline:
     """Структура данных для хранения информации о дедлайне"""
+    
     def __init__(self, title: str, course: str, due_date: str, source: str):
-        self.title = title      # Название задания
-        self.course = course    # Название курса
-        self.due_date = due_date  # Дата дедлайна в формате YYYY-MM-DD
-        self.source = source    # Источник: "lms" или "openedu"
+        self.title = title
+        self.course = course
+        self.due_date = due_date
+        self.source = source
     
     def __str__(self):
-        icon = "🎓" if self.source == "lms" else "🌐"
-        return f"{icon} {self.course} | 📝 {self.title} | 📅 {self.due_date}"
+        source_icon = "[LMS]" if self.source == "lms" else "[OE]"
+        return f"{source_icon} {self.course} | {self.title} | {self.due_date}"
     
     def to_dict(self):
         return {
@@ -30,618 +30,534 @@ class Deadline:
 
 
 class MoodleDeadlineParser:
-    def __init__(self, username, password, chrome_profile="", headless=False):
+    """Парсер дедлайнов для LMS СПбПУ и Openedu на Playwright"""
+    
+    def __init__(self, username: str, password: str, browser_type: str = "chromium", 
+                 headless: bool = False, chrome_profile: str = ""):
         self.username = username
         self.password = password
+        self.browser_type = browser_type
+        self.headless = headless
         self.chrome_profile = chrome_profile
-        self.headless = headless  # Добавить эту строку!
-        self.deadlines = []  # Массив структур Deadline
-        self.driver = None
+        self.deadlines: List[Deadline] = []
         
-    def init_driver(self):
-        """Инициализация драйвера Chrome"""
-        options = webdriver.ChromeOptions()
-        if self.chrome_profile:
-            options.add_argument(f"user-data-dir={self.chrome_profile}")
-        options.add_argument("--no-proxy-server")
-        options.add_argument("--disable-extensions")
-        options.add_argument("--disable-infobars")
-        options.add_argument("--no-sandbox")
-        options.add_argument("--disable-dev-shm-usage")
-        options.add_argument("--remote-allow-origins=*")
+        self.playwright = None
+        self.browser: Optional[Browser] = None
+        self.page: Optional[Page] = None
         
-        # Добавляем headless режим если выбран
-        if self.headless:
-            options.add_argument("--headless=new")
-            options.add_argument("--window-size=1920,1080")
-            print("🟢 Запуск браузера в фоновом режиме...")
-        else:
-            print("🟢 Запуск браузера...")
+        self.default_timeout = 30000
+        self.navigation_timeout = 60000
         
-        self.driver = webdriver.Chrome(options=options)
-        self.driver.implicitly_wait(10)
+    def __enter__(self):
+        return self
+        
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.cleanup()
+        return False
+        
+    def init_browser(self):
+        """Инициализация Playwright с системным браузером"""
+        self.playwright = sync_playwright().start()
+        
+        browser_launcher = getattr(self.playwright, self.browser_type)
+        
+        mode_str = "фоновом" if self.headless else "обычном"
+        print(f"[INFO] Запуск {self.browser_type.upper()} в {mode_str} режиме...")
+        
+        # Аргументы для обхода проблем на macOS
+        args = [
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+            "--disable-software-rasterizer",
+        ]
+        
+        # Для macOS ARM64 добавляем дополнительные флаги
+        if os.name == "posix":
+            args.extend([
+                "--disable-setuid-sandbox",
+                "--no-zygote",
+            ])
+        
+        launch_options = {
+            "headless": self.headless,
+            "args": args,
+        }
+        
+        # Пытаемся найти системный Chrome
+        if self.browser_type == "chromium":
+            system_chrome_paths = [
+                "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+                "/Applications/Chromium.app/Contents/MacOS/Chromium",
+            ]
+            
+            for chrome_path in system_chrome_paths:
+                if os.path.exists(chrome_path):
+                    launch_options["executable_path"] = chrome_path
+                    print(f"[INFO] Используется системный Chrome: {chrome_path}")
+                    break
+        
+        self.browser = browser_launcher.launch(**launch_options)
+        
+        self.context = self.browser.new_context(
+            viewport={"width": 1920, "height": 1080},
+            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            locale="ru-RU",
+            timezone_id="Europe/Moscow",
+        )
+        
+        self.page = self.context.new_page()
+        self.page.set_default_timeout(self.default_timeout)
+        
+    def cleanup(self):
+        """Закрытие ресурсов"""
+        if self.browser:
+            self.browser.close()
+        if self.playwright:
+            self.playwright.stop()
+        print("[INFO] Браузер закрыт")
     
     def login_lms(self) -> bool:
         """Вход в LMS СПбПУ"""
-        print("\n" + "="*50)
-        print("🔐 ВХОД В LMS СПбПУ")
-        print("="*50)
+        print("\n" + "=" * 50)
+        print("[AUTH] ВХОД В LMS СПбПУ")
+        print("=" * 50)
         
         try:
-            print("🌐 Переход на страницу входа...")
-            self.driver.get('https://lms.spbstu.ru/login/index.php')
+            print("[INFO] Переход на страницу входа...")
+            self.page.goto('https://lms.spbstu.ru/login/index.php', 
+                          wait_until="domcontentloaded", 
+                          timeout=self.navigation_timeout)
             sleep(2)
             
-            # Ищем и нажимаем кнопку единого входа
             try:
-                sso_elements = self.driver.find_elements(By.XPATH, "//*[contains(text(), 'единой записи СПБПУ')]")
-                if sso_elements:
-                    sso_elements[0].find_element(By.XPATH, "..").click()
-                    print("✅ Нажата кнопка 'Вход по единой записи СПБПУ'")
+                sso_locator = self.page.locator("//*[contains(text(), 'единой записи СПБПУ')]").first
+                if sso_locator.count() > 0:
+                    sso_locator.locator("xpath=..").click(timeout=5000)
+                    print("[OK] Нажата кнопка входа по единой записи СПБПУ")
                 else:
-                    sso_button = self.driver.find_element(By.CSS_SELECTOR, "div.auth0-lock-social-button-text")
-                    sso_button.find_element(By.XPATH, "..").click()
-                    print("✅ Нажата кнопка входа (по классу)")
+                    self.page.locator("div.auth0-lock-social-button-text").first.click(timeout=5000)
+                    print("[OK] Нажата кнопка входа (по классу)")
             except Exception as e:
-                print(f"⚠️ Не удалось найти кнопку SSO: {e}")
+                print(f"[WARN] Не удалось найти кнопку SSO: {e}")
             
             sleep(3)
             
-            # Заполняем форму входа
-            print("🔑 Заполнение формы входа...")
+            print("[INFO] Заполнение формы входа...")
             
-            login_field = WebDriverWait(self.driver, 10).until(
-                EC.presence_of_element_located((By.ID, "user"))
-            )
-            login_field.clear()
-            login_field.send_keys(self.username)
-            print("✅ Логин введен")
+            self.page.wait_for_selector("#user", timeout=10000)
+            self.page.fill("#user", self.username)
+            print("[OK] Логин введен")
             
-            password_field = self.driver.find_element(By.ID, "password")
-            password_field.clear()
-            password_field.send_keys(self.password)
-            print("✅ Пароль введен")
+            self.page.fill("#password", self.password)
+            print("[OK] Пароль введен")
             
-            login_button = self.driver.find_element(By.ID, "doLogin")
-            login_button.click()
-            print("✅ Кнопка 'Войти' нажата")
+            with self.page.expect_navigation(timeout=30000):
+                self.page.click("#doLogin")
+            print("[OK] Кнопка Войти нажата")
             
             sleep(5)
             
-            current_url = self.driver.current_url
+            current_url = self.page.url
             if "lms.spbstu.ru" in current_url and "login" not in current_url.lower():
-                print("✅ Вход в LMS выполнен успешно!")
+                print("[OK] Вход в LMS выполнен успешно")
                 return True
             else:
-                print(f"⚠️ Возможно, вход не удался. Текущий URL: {current_url}")
+                print(f"[WARN] Возможно, вход не удался. Текущий URL: {current_url}")
                 return False
                 
+        except PlaywrightTimeout as e:
+            print(f"[ERROR] Таймаут при входе в LMS: {e}")
+            return False
         except Exception as e:
-            print(f"❌ Ошибка при входе в LMS: {e}")
+            print(f"[ERROR] Ошибка при входе в LMS: {e}")
+            if self.page:
+                self.page.screenshot(path="lms_login_error.png")
             return False
     
     def login_openedu(self) -> bool:
         """Вход в Openedu через учетную запись СПбПУ"""
-        print("\n" + "="*50)
-        print("🔐 ВХОД В OPENEDU")
-        print("="*50)
+        print("\n" + "=" * 50)
+        print("[AUTH] ВХОД В OPENEDU")
+        print("=" * 50)
         
         try:
-            print("🌐 Переход на страницу входа Openedu...")
-            self.driver.get('https://sso.openedu.ru/realms/openedu/protocol/openid-connect/auth?client_id=plp&redirect_uri=https://openedu.ru/auth/complete/npoedsso/&state=kJVuDiqO1d3hJkl4aUdhkEnxEW34utAY&response_type=code&nonce=9uswzIVCibPRLfD7mQpKaclt3tq9tjczzRVhC5GYeLPWm2ule630aMpzUqadrxp0&scope=openid+profile+email')
+            print("[INFO] Переход на страницу входа Openedu...")
+            auth_url = 'https://sso.openedu.ru/realms/openedu/protocol/openid-connect/auth?client_id=plp&redirect_uri=https://openedu.ru/auth/complete/npoedsso/&state=kJVuDiqO1d3hJkl4aUdhkEnxEW34utAY&response_type=code&nonce=9uswzIVCibPRLfD7mQpKaclt3tq9tjczzRVhC5GYeLPWm2ule630aMpzUqadrxp0&scope=openid+profile+email'
+            self.page.goto(auth_url, wait_until="domcontentloaded", timeout=self.navigation_timeout)
             sleep(3)
             
-            # Ищем кнопку "Политех" для входа через СПбПУ
-            try:
-                # Ищем по точному классу и тексту
-                polytech_span = self.driver.find_element(By.CSS_SELECTOR, "span.social-form__label")
-                if "Политех" in polytech_span.text:
-                    # Поднимаемся к родительской ссылке
-                    polytech_link = polytech_span.find_element(By.XPATH, "../..")
-                    polytech_link.click()
-                    print("✅ Нажата кнопка 'Политех'")
-                else:
-                    raise Exception("Текст не совпадает")
-                    
-            except Exception as e:
+            polytech_clicked = False
+            strategies = [
+                ("CSS + текст", lambda: self.page.locator("span.social-form__label:has-text('Политех')").first),
+                ("XPath по тексту", lambda: self.page.locator("xpath=//span[contains(text(), 'Политех')]/ancestor::a").first),
+                ("XPath по href", lambda: self.page.locator("xpath=//a[contains(@href, 'spbstu')]").first),
+            ]
+            
+            for strategy_name, locator_func in strategies:
                 try:
-                    # Запасной вариант: ищем по тексту
-                    polytech_link = self.driver.find_element(By.XPATH, "//span[contains(text(), 'Политех')]/ancestor::a")
-                    polytech_link.click()
-                    print("✅ Нажата кнопка входа через СПбПУ (по тексту)")
-                    
-                except Exception as e:
-                    try:
-                        # Еще один запасной вариант: ищем по ссылке
-                        polytech_link = self.driver.find_element(By.XPATH, "//a[contains(@href, 'spbstu')]")
-                        polytech_link.click()
-                        print("✅ Нажата кнопка входа через СПбПУ (по ссылке)")
-                        
-                    except Exception as e:
-                        print(f"⚠️ Не удалось найти кнопку Политех: {e}")
-                        # Сохраняем скриншот для отладки
-                        self.driver.save_screenshot("openedu_sso_not_found.png")
-                        # Возможно, мы уже на странице входа? Продолжаем выполнение
-                        pass
-
+                    locator = locator_func()
+                    if locator.count() > 0 and locator.is_visible(timeout=3000):
+                        with self.page.expect_navigation(timeout=30000, wait_until="domcontentloaded"):
+                            locator.click(timeout=5000)
+                        print(f"[OK] Нажата кнопка входа через СПбПУ ({strategy_name})")
+                        polytech_clicked = True
+                        break
+                except:
+                    continue
+            
+            if not polytech_clicked:
+                print("[WARN] Не удалось найти кнопку Политех")
+                if self.page:
+                    self.page.screenshot(path="openedu_sso_not_found.png")
+            
             sleep(3)
             
-            # Проверяем, не перенаправило ли нас после нажатия кнопки
-            current_url = self.driver.current_url
-            if "openedu.ru" in current_url:
-                print("✅ Автоматический вход выполнен!")
+            if "openedu.ru" in self.page.url:
+                print("[OK] Автоматический вход выполнен")
                 return True
             
-            # Теперь мы на странице входа СПбПУ (возможно, с уже заполненными полями)
-            print("🔑 Проверка необходимости ввода логина/пароля...")
+            print("[INFO] Проверка необходимости ввода логина/пароля...")
             
             try:
-                # Проверяем, есть ли поле логина (если нет - возможно авто-вход)
-                login_field = WebDriverWait(self.driver, 5).until(
-                    EC.presence_of_element_located((By.ID, "user"))
-                )
-                
-                # Если поле логина пустое, заполняем
-                current_value = login_field.get_attribute("value")
-                if not current_value:
-                    login_field.clear()
-                    login_field.send_keys(self.username)
-                    print("✅ Логин введен")
-                else:
-                    print("✅ Логин уже заполнен")
-                
-                # Поле пароля
-                password_field = self.driver.find_element(By.ID, "password")
-                current_password = password_field.get_attribute("value")
-                if not current_password:
-                    password_field.clear()
-                    password_field.send_keys(self.password)
-                    print("✅ Пароль введен")
-                else:
-                    print("✅ Пароль уже заполнен")
-                
-                # Кнопка входа
-                login_button = self.driver.find_element(By.ID, "doLogin")
-                
-                # Проверяем, активна ли кнопка и нужно ли нажимать
-                if login_button.is_enabled():
-                    # Делаем небольшую паузу перед нажатием
-                    sleep(1)
-                    login_button.click()
-                    print("✅ Кнопка 'Войти' нажата")
-                else:
-                    print("⏳ Кнопка 'Войти' неактивна, возможно авто-вход")
-                
-            except TimeoutException:
-                # Если поле логина не найдено, значит произошел авто-вход
-                print("✅ Поле логина не найдено - предположительно автоматический вход")
-                pass
+                if self.page.is_visible("#user", timeout=5000):
+                    current_value = self.page.input_value("#user", timeout=2000)
+                    if not current_value:
+                        self.page.fill("#user", self.username)
+                        print("[OK] Логин введен")
+                    else:
+                        print("[OK] Логин уже заполнен")
+                    
+                    if not self.page.input_value("#password", timeout=2000):
+                        self.page.fill("#password", self.password)
+                        print("[OK] Пароль введен")
+                    else:
+                        print("[OK] Пароль уже заполнен")
+                    
+                    if self.page.is_enabled("#doLogin"):
+                        sleep(1)
+                        with self.page.expect_navigation(timeout=30000, wait_until="domcontentloaded"):
+                            self.page.click("#doLogin")
+                        print("[OK] Кнопка Войти нажата")
+                        
+            except PlaywrightTimeout:
+                print("[OK] Поле логина не найдено - предположительно автоматический вход")
             except Exception as e:
-                print(f"⚠️ Нестандартная ситуация при заполнении формы: {e}")
+                print(f"[WARN] Нестандартная ситуация: {e}")
             
-            # Ждем завершения входа
-            print("⏳ Ожидание завершения входа...")
+            print("[INFO] Ожидание завершения входа...")
             sleep(8)
             
-            # Проверяем успешность входа
-            current_url = self.driver.current_url
-            if "openedu.ru" in current_url:
-                print("✅ Вход в Openedu выполнен успешно!")
+            if "openedu.ru" in self.page.url:
+                print("[OK] Вход в Openedu выполнен успешно")
                 return True
             else:
-                print(f"⚠️ Текущий URL после входа: {current_url}")
-                # Делаем дополнительную паузу и проверяем еще раз
                 sleep(5)
-                current_url = self.driver.current_url
-                if "openedu.ru" in current_url:
-                    print("✅ Вход в Openedu подтвержден после паузы!")
+                if "openedu.ru" in self.page.url:
+                    print("[OK] Вход подтвержден после паузы")
                     return True
                 return False
                 
         except Exception as e:
-            print(f"❌ Ошибка при входе в Openedu: {e}")
-            self.driver.save_screenshot("openedu_login_error.png")
+            print(f"[ERROR] Ошибка при входе в Openedu: {e}")
+            if self.page:
+                self.page.screenshot(path="openedu_login_error.png")
             return False
     
-    def parse_lms_deadlines(self) -> list:
+    def parse_lms_deadlines(self) -> List[Deadline]:
         """Парсит дедлайны с LMS СПбПУ"""
         deadlines = []
+        pages = ['/my/', '/calendar/view.php?view=upcoming']
         
-        # Страницы для парсинга в LMS
-        pages = [
-            '/my/',
-            '/calendar/view.php?view=upcoming',
-        ]
-        
-        for page in pages:
+        for page_path in pages:
             try:
-                url = f"https://lms.spbstu.ru{page}"
-                print(f"🌐 Парсинг LMS: {url}")
-                self.driver.get(url)
+                url = f"https://lms.spbstu.ru{page_path}"
+                print(f"[INFO] Парсинг LMS: {url}")
+                self.page.goto(url, wait_until="domcontentloaded", timeout=self.navigation_timeout)
                 sleep(3)
                 
-                # Здесь нужно будет добавить реальные селекторы для LMS
-                # Пока пример
-                events = self.driver.find_elements(By.CLASS_NAME, "event")
+                events = self.page.locator(".event").all()
                 
                 for event in events:
                     try:
-                        title = event.find_element(By.CLASS_NAME, "event-name").text
-                        course = event.find_element(By.CLASS_NAME, "course-name").text
-                        date = event.find_element(By.CLASS_NAME, "date").text
+                        title = event.locator(".event-name").text_content(timeout=2000)
+                        course = event.locator(".course-name").text_content(timeout=2000)
+                        date = event.locator(".date").text_content(timeout=2000)
                         
-                        deadline = Deadline(title, course, date, "lms")
-                        deadlines.append(deadline)
+                        if title and course and date:
+                            deadline = Deadline(title.strip(), course.strip(), date.strip(), "lms")
+                            deadlines.append(deadline)
                     except:
                         continue
                         
             except Exception as e:
-                print(f"⚠️ Ошибка при парсинге {page}: {e}")
+                print(f"[WARN] Ошибка при парсинге {page_path}: {e}")
         
         return deadlines
     
-    def parse_openedu_deadlines(self) -> list:
-        """Парсит дедлайны с Openedu со страницы моих курсов"""
+    def parse_openedu_deadlines(self) -> List[Deadline]:
+        """Парсит дедлайны с Openedu"""
         deadlines = []
+        courses_url = 'https://openedu.ru/my/courses/'
         
         try:
-            # Для headless режима используем прямой переход
-            if self.headless:
-                print("\n🖥️ Фоновый режим: прямой переход на страницу курсов...")
-                self.driver.get('https://openedu.ru/my/courses/')
-                sleep(8)
-                
-                # Проверяем, не перенаправило ли на страницу входа
-                if "login" in self.driver.current_url or "auth" in self.driver.current_url:
-                    print("⚠️ Требуется авторизация, выполняем вход...")
-                    # Если вылетело из сессии, пробуем войти заново
-                    if not self.login_openedu():
-                        print("❌ Не удалось авторизоваться")
-                        return deadlines
-                    # После входа снова переходим на курсы
-                    self.driver.get('https://openedu.ru/my/courses/')
-                    sleep(8)
-            else:
-                # Для обычного режима - кликаем по меню
-                print("\n👤 Открываем меню профиля...")
-                try:
-                    profile_icon = WebDriverWait(self.driver, 10).until(
-                        EC.element_to_be_clickable((By.CSS_SELECTOR, "img.profile-menu__icon"))
-                    )
-                    profile_icon.click()
-                    sleep(2)
-                    
-                    print("📚 Переходим в 'Мои курсы'...")
-                    my_courses_link = WebDriverWait(self.driver, 10).until(
-                        EC.element_to_be_clickable((By.XPATH, "//a[contains(@href, '/my/courses/') and contains(text(), 'Мои курсы')]"))
-                    )
-                    my_courses_link.click()
-                    sleep(5)
-                except Exception as e:
-                    print(f"⚠️ Ошибка при навигации через меню: {e}")
-                    print("➡️ Пробуем прямой переход...")
-                    self.driver.get('https://openedu.ru/my/courses/')
-                    sleep(8)
+            print("\n[INFO] Переход к моим курсам...")
+            self.page.goto(courses_url, wait_until="networkidle", timeout=self.navigation_timeout)
+            sleep(5)
             
-            # Шаг 3: Получаем ВСЕ названия курсов
-            print("🔍 Ищем все курсы...")
+            if "login" in self.page.url or "auth" in self.page.url:
+                print("[WARN] Требуется авторизация...")
+                if not self.login_openedu():
+                    return deadlines
+                self.page.goto(courses_url, wait_until="networkidle", timeout=self.navigation_timeout)
+                sleep(5)
             
-            # Ждем загрузки карточек курсов
-            wait_time = 20 if self.headless else 10
+            print("[INFO] Поиск курсов...")
             try:
-                WebDriverWait(self.driver, wait_time).until(
-                    EC.presence_of_element_located((By.CSS_SELECTOR, "div.ed-product-card"))
-                )
-                print("✅ Карточки курсов загружены")
-            except:
-                print("⚠️ Карточки курсов не загрузились, пробуем продолжить...")
-            
-            # Находим все карточки курсов
-            course_cards = self.driver.find_elements(By.CSS_SELECTOR, "div.ed-product-card")
-            print(f"📊 Найдено карточек курсов: {len(course_cards)}")
-            
-            if len(course_cards) == 0:
-                print("❌ Нет доступных курсов")
-                # Сохраняем скриншот для отладки
-                self.driver.save_screenshot("openedu_no_courses.png")
+                self.page.wait_for_selector("div.ed-product-card", timeout=20000)
+                print("[OK] Карточки курсов загружены")
+            except PlaywrightTimeout:
+                print("[WARN] Карточки не загрузились")
+                if self.page:
+                    self.page.screenshot(path="openedu_no_courses.png")
                 return deadlines
             
-            # Сохраняем названия курсов
+            course_cards = self.page.locator("div.ed-product-card").all()
+            print(f"[INFO] Найдено курсов: {len(course_cards)}")
+            
             course_titles = []
             for card in course_cards:
                 try:
-                    title = card.find_element(By.CSS_SELECTOR, "div.ed-product-card__header__title span").text.strip()
+                    title_elem = card.locator("div.ed-product-card__header__title span")
+                    title = title_elem.text_content(timeout=3000)
+                    title = title.strip() if title else f"Курс {len(course_titles)+1}"
                     course_titles.append(title)
-                    print(f"  📌 Найден курс: {title}")
-                except Exception as e:
-                    print(f"  ⚠️ Ошибка при получении названия курса: {e}")
-                    course_titles.append(f"Курс {len(course_titles) + 1}")
+                except:
+                    course_titles.append(f"Курс {len(course_titles)+1}")
             
-            # Шаг 4: Обрабатываем каждый курс по очереди
-            for course_index, course_title in enumerate(course_titles, 1):
+            for idx, course_title in enumerate(course_titles, 1):
+                print(f"\n[INFO] Курс {idx}/{len(course_titles)}: {course_title[:50]}...")
+                
                 try:
-                    print(f"\n--- Обработка курса {course_index}: {course_title} ---")
-                    
-                    # Находим кнопку для текущего курса ЗАНОВО
-                    course_buttons = self.driver.find_elements(By.XPATH, "//*[contains(text(), 'К материалам курса')]")
-                    
-                    if course_index > len(course_buttons):
-                        print(f"⚠️ Не найдена кнопка для курса {course_index}, пропускаем")
+                    course_buttons = self.page.locator("//*[contains(text(), 'К материалам курса')]").all()
+                    if idx > len(course_buttons):
+                        print(f"[WARN] Кнопка не найдена для курса {idx}")
                         continue
                     
-                    # Берем соответствующую кнопку
-                    current_button = course_buttons[course_index - 1]
+                    button = course_buttons[idx - 1]
+                    button.scroll_into_view_if_needed(timeout=5000)
+                    sleep(2)
                     
-                    # Прокручиваем до кнопки и кликаем
-                    self.driver.execute_script("arguments[0].scrollIntoView(true);", current_button)
-                    sleep(2 if not self.headless else 3)
-                    
-                    # Пробуем кликнуть разными способами
                     try:
-                        current_button.click()
+                        button.click(timeout=5000)
                     except:
                         try:
-                            self.driver.execute_script("arguments[0].click();", current_button)
+                            handle = button.element_handle(timeout=3000)
+                            self.page.evaluate("el => el.click()", handle)
                         except Exception as e:
-                            print(f"⚠️ Не удалось кликнуть по кнопке: {e}")
+                            print(f"[WARN] Не удалось кликнуть: {e}")
                             continue
                     
-                    print("✅ Перешли к материалам курса")
+                    sleep(5)
                     
-                    sleep(5 if not self.headless else 8)
+                    schedule_selectors = [
+                        "a.nav-link:has-text('Расписание курса')",
+                        "a:has-text('Расписание')",
+                        "a[href*='dates']",
+                        "a.nav-link[href*='static_tab']"
+                    ]
                     
-                    # Шаг 5: Ищем и нажимаем "Расписание курса"
-                    try:
-                        schedule_found = False
-                        
-                        # Варианты поиска расписания
-                        selectors = [
-                            "//a[contains(@class, 'nav-link') and contains(text(), 'Расписание курса')]",
-                            "//a[contains(text(), 'Расписание')]",
-                            "//a[contains(@href, 'dates')]",
-                            "//a[contains(@class, 'nav-link') and contains(@href, 'static_tab')]"
-                        ]
-                        
-                        for selector in selectors:
-                            try:
-                                schedule_link = WebDriverWait(self.driver, 5).until(
-                                    EC.element_to_be_clickable((By.XPATH, selector))
-                                )
-                                schedule_link.click()
-                                print("✅ Перешли в расписание курса")
-                                schedule_found = True
+                    schedule_clicked = False
+                    for selector in schedule_selectors:
+                        try:
+                            link = self.page.locator(selector).first
+                            if link.is_visible(timeout=3000):
+                                link.click(timeout=5000)
+                                print("[OK] Перешли в расписание")
+                                schedule_clicked = True
                                 break
-                            except:
-                                continue
-                        
-                        if not schedule_found:
-                            print("⚠️ Ссылка на расписание не найдена")
-                            self.driver.get('https://openedu.ru/my/courses/')
-                            sleep(5 if not self.headless else 8)
+                        except:
                             continue
-                        
-                        sleep(5 if not self.headless else 8)
-                        
-                    except Exception as e:
-                        print(f"⚠️ Ошибка при переходе в расписание: {e}")
-                        self.driver.get('https://openedu.ru/my/courses/')
-                        sleep(5 if not self.headless else 8)
+                    
+                    if not schedule_clicked:
+                        print("[WARN] Расписание не найдено")
+                        self.page.goto(courses_url)
+                        sleep(3)
                         continue
                     
-                    # Шаг 6: Парсим таблицу расписания (код парсинга таблицы без изменений)
-                    try:
-                        # Ждем загрузки таблицы
-                        WebDriverWait(self.driver, wait_time).until(
-                            EC.presence_of_element_located((By.TAG_NAME, "table"))
-                        )
-                        
-                        tables = self.driver.find_elements(By.TAG_NAME, "table")
-                        
-                        if not tables:
-                            print("⚠️ Таблица не найдена на странице")
-                        else:
-                            print(f"📋 Найдено таблиц: {len(tables)}")
-                            
-                            for table_index, table in enumerate(tables, 1):
-                                # Получаем все строки таблицы
-                                rows = table.find_elements(By.TAG_NAME, "tr")
-                                print(f"  Таблица {table_index}: найдено строк {len(rows)}")
-                                
-                                # Определяем количество колонок по заголовку
-                                if len(rows) > 0:
-                                    header_cells = rows[0].find_elements(By.TAG_NAME, "td") if rows[0].find_elements(By.TAG_NAME, "td") else rows[0].find_elements(By.TAG_NAME, "th")
-                                    col_count = len(header_cells)
-                                    print(f"    Колонок в таблице: {col_count}")
-                                
-                                # Словарь для отслеживания объединенных ячеек
-                                rowspan_tracker = {}
-                                
-                                # Пропускаем заголовочную строку (первую)
-                                for row_index, row in enumerate(rows):
-                                    if row_index == 0:
-                                        continue
-                                    
-                                    try:
-                                        cells = row.find_elements(By.TAG_NAME, "td")
-                                        
-                                        if not cells:
-                                            continue
-                                        
-                                        title = cells[0].text.strip()
-                                        
-                                        if not title:
-                                            continue
-                                        
-                                        date_text = None
-                                        
-                                        # Проверяем объединенные ячейки
-                                        for col_idx, (remaining, text) in list(rowspan_tracker.items()):
-                                            if remaining > 0:
-                                                date_text = text
-                                                rowspan_tracker[col_idx] = [remaining - 1, text]
-                                                break
-                                        
-                                        if not date_text:
-                                            for cell in reversed(cells):
-                                                cell_text = cell.text.strip()
-                                                if cell_text and ('.' in cell_text or cell_text.replace('-', '').strip()):
-                                                    date_text = cell_text
-                                                    
-                                                    try:
-                                                        rowspan_attr = cell.get_attribute("rowspan")
-                                                        if rowspan_attr:
-                                                            rowspan = int(rowspan_attr)
-                                                            if rowspan > 1:
-                                                                col_index = cells.index(cell)
-                                                                rowspan_tracker[col_index] = [rowspan - 1, cell_text]
-                                                    except:
-                                                        pass
-                                                    break
-                                        
-                                        if not date_text:
-                                            last_cell = cells[-1]
-                                            date_text = last_cell.text.strip()
-                                        
-                                        if not date_text or date_text == '-' or date_text == '—' or 'инд.' in date_text.lower():
-                                            print(f"    ⚠️ Пропущен (нет даты): {title} -> {date_text}")
-                                            continue
-                                        
-                                        try:
-                                            if '.' in date_text:
-                                                parts = date_text.split('.')
-                                                if len(parts) >= 2:
-                                                    day = parts[0].strip().zfill(2)
-                                                    month = parts[1].strip().zfill(2)
-                                                    
-                                                    if len(parts) >= 3:
-                                                        year = parts[2].strip()
-                                                        if len(year) == 2:
-                                                            year = f"20{year}"
-                                                        elif len(year) == 4:
-                                                            year = year
-                                                        else:
-                                                            year = "2026"
-                                                    else:
-                                                        year = "2026"
-                                                    
-                                                    if day.isdigit() and month.isdigit() and year.isdigit():
-                                                        formatted_date = f"{year}-{month}-{day}"
-                                                        
-                                                        deadline = Deadline(
-                                                            title=f"{course_title}: {title}",
-                                                            course=course_title,
-                                                            due_date=formatted_date,
-                                                            source="openedu"
-                                                        )
-                                                        deadlines.append(deadline)
-                                                        print(f"    ✅ Добавлен: {title[:50]}... -> {formatted_date}")
-                                                    else:
-                                                        print(f"    ⚠️ Некорректная дата: {date_text}")
-                                                else:
-                                                    print(f"    ⚠️ Неверный формат даты: {date_text}")
-                                            else:
-                                                print(f"    ⚠️ Дата не содержит точек: {date_text}")
-                                                
-                                        except Exception as e:
-                                            print(f"    ⚠️ Ошибка парсинга даты '{date_text}': {e}")
-                                            continue
-                                            
-                                    except Exception as e:
-                                        print(f"    ⚠️ Ошибка обработки строки {row_index}: {e}")
-                                        continue
-                                
-                                rowspan_tracker.clear()
-
-                    except Exception as e:
-                        print(f"⚠️ Ошибка при парсинге таблицы: {e}")
+                    sleep(5)
                     
-                    # Шаг 7: Возвращаемся к списку курсов
-                    print("⏎ Возвращаемся к списку курсов...")
-                    self.driver.get('https://openedu.ru/my/courses/')
-                    sleep(5 if not self.headless else 8)
+                    deadlines.extend(self._parse_schedule_table(course_title))
+                    
+                    self.page.goto(courses_url, wait_until="domcontentloaded")
+                    sleep(3)
                     
                 except Exception as e:
-                    print(f"⚠️ Ошибка при обработке курса {course_index}: {e}")
-                    self.driver.get('https://openedu.ru/my/courses/')
-                    sleep(5 if not self.headless else 8)
+                    print(f"[WARN] Ошибка обработки курса: {e}")
+                    self.page.goto(courses_url)
+                    sleep(3)
                     continue
             
-            print(f"\n📌 Всего найдено дедлайнов Openedu: {len(deadlines)}")
+            print(f"\n[INFO] Найдено дедлайнов Openedu: {len(deadlines)}")
             
         except Exception as e:
-            print(f"❌ Ошибка при парсинге Openedu: {e}")
-            self.driver.save_screenshot("openedu_parse_error.png")
+            print(f"[ERROR] Ошибка парсинга Openedu: {e}")
+            if self.page:
+                self.page.screenshot(path="openedu_parse_error.png")
         
         return deadlines
     
-    def print_deadlines(self, deadlines: list, source_name: str):
+    def _parse_schedule_table(self, course_title: str) -> List[Deadline]:
+        """Вспомогательный метод парсинга таблицы расписания"""
+        deadlines = []
+        
+        try:
+            self.page.wait_for_selector("table", timeout=15000)
+            tables = self.page.locator("table").all()
+            
+            for table in tables:
+                rows = table.locator("tr").all()
+                if len(rows) < 2:
+                    continue
+                
+                rowspan_tracker = {}
+                
+                for row_idx, row in enumerate(rows):
+                    if row_idx == 0:
+                        continue
+                    
+                    cells = row.locator("td").all()
+                    if not cells:
+                        continue
+                    
+                    def get_cell_text(cell) -> str:
+                        try:
+                            text = cell.text_content(timeout=2000)
+                            return text.strip() if text else ""
+                        except:
+                            return ""
+                    
+                    title = get_cell_text(cells[0])
+                    if not title:
+                        continue
+                    
+                    date_text = None
+                    for cell in reversed(cells):
+                        text = get_cell_text(cell)
+                        if text and '.' in text:
+                            date_text = text
+                            break
+                    
+                    if not date_text or date_text in ['-', '—'] or 'инд.' in date_text.lower():
+                        continue
+                    
+                    try:
+                        if '.' in date_text:
+                            parts = date_text.split('.')
+                            if len(parts) >= 2:
+                                day = parts[0].strip().zfill(2)
+                                month = parts[1].strip().zfill(2)
+                                
+                                if len(parts) >= 3 and parts[2].strip():
+                                    year = parts[2].strip()
+                                    if len(year) == 2:
+                                        year = f"20{year}"
+                                    elif len(year) != 4:
+                                        year = "2026"
+                                else:
+                                    year = "2026"
+                                
+                                if day.isdigit() and month.isdigit() and year.isdigit():
+                                    formatted_date = f"{year}-{month}-{day}"
+                                    deadlines.append(Deadline(
+                                        title=f"{course_title}: {title}",
+                                        course=course_title,
+                                        due_date=formatted_date,
+                                        source="openedu"
+                                    ))
+                    except Exception as e:
+                        print(f"[WARN] Ошибка парсинга даты '{date_text}': {e}")
+                        continue
+                
+        except Exception as e:
+            print(f"[WARN] Ошибка парсинга таблицы: {e}")
+        
+        return deadlines
+    
+    def print_deadlines(self, deadlines: List[Deadline], source_name: str):
         """Вывод дедлайнов в консоль"""
         if not deadlines:
-            print(f"\n📭 Дедлайнов в {source_name} не найдено")
+            print(f"\n[INFO] Дедлайнов в {source_name} не найдено")
             return
         
-        print(f"\n" + "="*60)
-        print(f"📋 {source_name.upper()}: {len(deadlines)} дедлайнов")
-        print("="*60)
+        print("\n" + "=" * 60)
+        print(f"[LIST] {source_name.upper()}: {len(deadlines)} дедлайнов")
+        print("=" * 60)
         
-        # Сортируем по дате
         sorted_deadlines = sorted(deadlines, key=lambda x: x.due_date)
         
         for i, deadline in enumerate(sorted_deadlines, 1):
-            print(f"\n{i}. {deadline}")
+            print(f"{i}. {deadline}")
     
     def save_all_deadlines(self):
         """Сохраняет все дедлайны в JSON"""
         if not self.deadlines:
-            print("📭 Нет данных для сохранения")
+            print("[INFO] Нет данных для сохранения")
             return
         
-        # Создаем папку для данных, если её нет
         os.makedirs("data", exist_ok=True)
         
-        # Сохраняем общий файл
         filename = f"data/deadlines_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
         data = [d.to_dict() for d in self.deadlines]
         with open(filename, 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
-        print(f"\n💾 Все данные сохранены в {filename}")
+        print(f"\n[SAVE] Данные сохранены в {filename}")
     
-    def show_menu(self):
-        """Показывает меню и возвращает выбор пользователя"""
-        print("\n" + "="*60)
-        print("🚀 ПАРСЕР ДЕДЛАЙНОВ")
-        print("="*60)
+    def show_menu(self) -> str:
+        """Показывает меню"""
+        print("\n" + "=" * 60)
+        print("[MENU] ПАРСЕР ДЕДЛАЙНОВ (Playwright)")
+        print("=" * 60)
+        print(f"Браузер: {self.browser_type.upper()} | Режим: {'Headless' if self.headless else 'Visible'}")
+        print("-" * 60)
         print("1. Получить дедлайны из LMS СПбПУ")
         print("2. Получить дедлайны из Openedu")
         print("3. Получить из обоих источников")
         print("4. Настройки")
         print("5. Выйти")
-        print("-"*60)
-        
-        choice = input("Выберите действие (1-5): ").strip()
-        return choice
+        print("-" * 60)
+        return input("Выберите действие (1-5): ").strip()
     
     def show_settings(self):
         """Меню настроек"""
         while True:
-            print("\n" + "="*60)
-            print("⚙️ НАСТРОЙКИ")
-            print("="*60)
-            mode = "фоновом" if self.headless else "обычном"
-            print(f"1. Режим отображения браузера: сейчас в {mode} режиме")
-            print("2. Вернуться в главное меню")
-            print("-"*60)
+            print("\n" + "=" * 60)
+            print("[SETTINGS] НАСТРОЙКИ")
+            print("=" * 60)
+            print(f"1. Браузер: {self.browser_type} (chromium/firefox/webkit)")
+            print(f"2. Режим отображения: {'headless' if self.headless else 'visible'}")
+            print("3. Вернуться в главное меню")
+            print("-" * 60)
             
-            choice = input("Выберите действие (1-2): ").strip()
+            choice = input("Выберите действие (1-3): ").strip()
             
             if choice == '1':
-                self.headless = not self.headless
-                mode = "фоновый" if self.headless else "обычный"
-                print(f"✅ Режим изменен на {mode}")
+                browsers = ['chromium', 'firefox', 'webkit']
+                print(f"Доступные браузеры: {', '.join(browsers)}")
+                new_browser = input("Введите название браузера: ").strip().lower()
+                if new_browser in browsers:
+                    self.browser_type = new_browser
+                    print(f"[OK] Браузер изменен на {new_browser}")
+                else:
+                    print("[ERROR] Неверное название браузера")
             elif choice == '2':
+                self.headless = not self.headless
+                mode = "headless" if self.headless else "visible"
+                print(f"[OK] Режим изменен на {mode}")
+            elif choice == '3':
                 break
             else:
-                print("❌ Неверный выбор")
+                print("[ERROR] Неверный выбор")
     
     def run(self):
         """Основной метод запуска с меню"""
@@ -649,7 +565,7 @@ class MoodleDeadlineParser:
             choice = self.show_menu()
             
             if choice == '5':
-                print("\n👋 До свидания!")
+                print("\n[EXIT] Завершение работы")
                 break
             
             if choice == '4':
@@ -657,85 +573,88 @@ class MoodleDeadlineParser:
                 continue
             
             if choice not in ['1', '2', '3']:
-                print("\n❌ Неверный выбор. Попробуйте снова.")
+                print("\n[ERROR] Неверный выбор. Попробуйте снова.")
                 continue
             
-            # Инициализируем драйвер
-            self.init_driver()
+            self.init_browser()
             self.deadlines = []
             
             try:
                 if choice == '1':
                     if self.login_lms():
-                        print("\n🔍 Поиск дедлайнов в LMS...")
+                        print("\n[PARSE] Поиск дедлайнов в LMS...")
                         lms_deadlines = self.parse_lms_deadlines()
                         self.deadlines.extend(lms_deadlines)
                         self.print_deadlines(lms_deadlines, "LMS СПбПУ")
                 
                 elif choice == '2':
                     if self.login_openedu():
-                        print("\n🔍 Поиск дедлайнов в Openedu...")
+                        print("\n[PARSE] Поиск дедлайнов в Openedu...")
                         openedu_deadlines = self.parse_openedu_deadlines()
                         self.deadlines.extend(openedu_deadlines)
                         self.print_deadlines(openedu_deadlines, "Openedu")
                 
                 elif choice == '3':
-                    # Сначала LMS
                     if self.login_lms():
-                        print("\n🔍 Поиск дедлайнов в LMS...")
+                        print("\n[PARSE] Поиск дедлайнов в LMS...")
                         lms_deadlines = self.parse_lms_deadlines()
                         self.deadlines.extend(lms_deadlines)
                         self.print_deadlines(lms_deadlines, "LMS СПбПУ")
                     
-                    # Затем Openedu
                     if self.login_openedu():
-                        print("\n🔍 Поиск дедлайнов в Openedu...")
+                        print("\n[PARSE] Поиск дедлайнов в Openedu...")
                         openedu_deadlines = self.parse_openedu_deadlines()
                         self.deadlines.extend(openedu_deadlines)
                         self.print_deadlines(openedu_deadlines, "Openedu")
                 
-                # Сохраняем результаты
                 if self.deadlines:
                     self.save_all_deadlines()
                 
+            except KeyboardInterrupt:
+                print("\n[WARN] Прервано пользователем")
             except Exception as e:
-                print(f"\n❌ Ошибка: {e}")
-            
+                print(f"\n[ERROR] Критическая ошибка: {e}")
             finally:
-                if self.driver:
-                    self.driver.quit()
+                self.cleanup()
             
-            print("\n" + "-"*60)
+            print("\n" + "-" * 60)
             input("Нажмите Enter, чтобы продолжить...")
 
-if __name__ == "__main__":
-    # Загрузка credentials
+
+def load_credentials(filepath: str = "misc/credentials.json") -> dict:
+    """Загрузка учетных данных из файла"""
     try:
-        with open("misc/credentials.json", 'r', encoding='utf-8') as f:
-            data = json.load(f)
+        with open(filepath, 'r', encoding='utf-8') as f:
+            return json.load(f)
     except FileNotFoundError:
-        print("❌ Файл credentials.json не найден в папке misc/")
-        print("Создайте файл со структурой:")
-        print("""
-{
-    "moodle": {
-        "username": "your.email@edu.spbstu.ru",
-        "password": "your_password"
-    },
-    "chrome": {
-        "chrome_profile": ""
-    }
-}
-        """)
+        print(f"[ERROR] Файл {filepath} не найден")
+        print("Создайте файл со следующей структурой:")
+        print(json.dumps({
+            "moodle": {
+                "username": "your.email@edu.spbstu.ru",
+                "password": "your_password"
+            },
+            "chrome": {
+                "chrome_profile": ""
+            }
+        }, indent=4, ensure_ascii=False))
         exit(1)
+    except json.JSONDecodeError as e:
+        print(f"[ERROR] Ошибка парсинга JSON: {e}")
+        exit(1)
+
+
+if __name__ == "__main__":
+    creds = load_credentials()
     
-    # Создаем парсер (по умолчанию headless=False - браузер видимый)
-    parser = MoodleDeadlineParser(
-        username=data['moodle']['username'],
-        password=data['moodle']['password'],
-        chrome_profile=data['chrome']['chrome_profile'],
-        headless=False  # По умолчанию браузер видимый
-    )
+    browser_type = os.getenv("BROWSER", "chromium").lower()
+    headless = os.getenv("HEADLESS", "false").lower() == "true"
     
-    # Запускаем с меню
-    parser.run()
+    with MoodleDeadlineParser(
+        username=creds['moodle']['username'],
+        password=creds['moodle']['password'],
+        chrome_profile=creds.get('chrome', {}).get('chrome_profile', ''),
+        browser_type=browser_type,
+        headless=headless
+    ) as parser:
+        parser.run()
