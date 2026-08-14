@@ -27,5 +27,5 @@
     }
 
 ## Зависимости
-- Python 3.6+
-- Selenium
+- Python 3.8+
+- Playwright
