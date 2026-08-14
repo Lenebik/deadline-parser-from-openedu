@@ -1,6 +1,20 @@
 # Openedu Deadline Extractor
 
-Create a `credentials.json` file in the project's root directory with the following structure:
+
+Парсер дедлайнов для Openedu с использованием Playwright. Программа автоматически собирает информацию о сроках сдачи заданий из двух образовательных платформ и сохраняет её в структурированном виде.
+
+---
+
+## Возможности
+
+- Автоматический вход в Openedu через учетную запись СПбПУ
+- Парсинг дедлайнов из расписания курсов на Openedu
+- Сохранение данных в JSON-формат с временной меткой
+- Поддержка различных браузеров (Chromium, Firefox, WebKit)
+- Режимы headless/visible для отладки
+
+
+Создайтк `credentials.json` в корневой директории, соблюдая следующую структуру:
 
     {
         "moodle": {
@@ -12,6 +26,6 @@ Create a `credentials.json` file in the project's root directory with the follow
         }
     }
 
-## Dependencies
+## Зависимости
 - Python 3.6+
 - Selenium
